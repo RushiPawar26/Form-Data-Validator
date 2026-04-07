@@ -4,6 +4,7 @@ import sys
 import uuid
 import logging
 import requests as http_requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -137,9 +138,6 @@ def validate_document_endpoint():
 @limiter.limit("20 per minute")
 def validate_multiple_endpoint():
     app.logger.info("=== /validate-multiple hit ===")
-    app.logger.info(f"Content-Type: {request.content_type}")
-    app.logger.info(f"Raw JSON body: {request.get_json(silent=True)}")
-    app.logger.info(f"Raw form body: {request.form.to_dict()}")
 
     form_data = (
         request.form.to_dict()
@@ -147,35 +145,53 @@ def validate_multiple_endpoint():
         else (request.get_json(silent=True) or request.form.to_dict())
     )
     form_data = dict(form_data) or {}
-    app.logger.info(f"Parsed form_data keys: {list(form_data.keys())}")
+    # log only keys, never values (PII protection)
+    app.logger.info(f"Received fields: {list(form_data.keys())}")
 
     name = form_data.get('name', '')
     id_number = form_data.get('id_number', '')
     department = form_data.get('department', '')
+    aadhaar_number = form_data.get('aadhaar_number', '')
 
-    results = []
-
+    # Build list of docs to process
+    docs = []
     for i in range(1, 4):
         file_id = form_data.get(f'file_id_{i}')
         doc_type = form_data.get(f'doc_type_{i}', '')
-        if not file_id or not doc_type:
-            continue
+        if file_id and doc_type:
+            docs.append((file_id, doc_type))
 
+    if not docs:
+        return jsonify({'validation_passed': False, 'results': [], 'error': 'No documents provided'}), 400
+
+    def process_one(file_id, doc_type):
         temp_path = _temp_path("pdf")
         try:
             download_from_drive(file_id, temp_path)
-            result = process_document(temp_path, {
+            return process_document(temp_path, {
                 'name': name,
                 'id_number': id_number,
                 'department': department,
                 'doc_type': doc_type,
+                'aadhaar_number': aadhaar_number,
             })
-            results.append(result)
         except Exception as e:
-            results.append({'doc_type': doc_type, 'status': str(e), 'validation_passed': False})
+            return {'doc_type': doc_type, 'status': str(e), 'validation_passed': False}
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    # Process all docs in parallel — each on its own thread
+    results = [None] * len(docs)
+    with ThreadPoolExecutor(max_workers=len(docs)) as executor:
+        future_to_idx = {executor.submit(process_one, fid, dt): idx
+                         for idx, (fid, dt) in enumerate(docs)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                results[idx] = {'doc_type': docs[idx][1], 'status': str(e), 'validation_passed': False}
 
     all_passed = all(r.get('validation_passed') for r in results)
     return jsonify({'validation_passed': all_passed, 'results': results})

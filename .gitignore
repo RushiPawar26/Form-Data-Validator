@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 venv/
-.env
+.env.example
 *.pdf
 *.db
 photo_debug.png
