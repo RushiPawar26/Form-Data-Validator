@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
 venv/
-.env.example
+
+# secrets — never push
+.env
+
+# generated files
 *.pdf
 *.db
 photo_debug.png
