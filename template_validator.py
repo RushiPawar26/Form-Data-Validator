@@ -245,7 +245,23 @@ def check_photo(doc_pil, doc_type):
     return {'photo_present': photo_found, 'photo_note': 'Contour detection in expected region'}
 
 
+def _normalize_doc_type(doc_type: str) -> str:
+    """Normalize doc type string to match DOC_CONFIG keys."""
+    import re
+    d = doc_type.lower().strip()
+    if re.search(r'adh?a+r', d):
+        return 'aadhaar card'
+    if 'marksheet' in d or 'mark sheet' in d:
+        return 'marksheet'
+    if 'college' in d or 'student id' in d:
+        return 'college id'
+    if 'pan' in d:
+        return 'pan card'
+    return d
+
+
 def run_template_checks(doc_pil, doc_type):
+    doc_type = _normalize_doc_type(doc_type)
     config = DOC_CONFIG.get(doc_type, {})
     results = {}
 

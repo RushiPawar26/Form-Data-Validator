@@ -1,0 +1,40 @@
+services:
+
+  ocr-validator:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: 10000
+      WEB_CONCURRENCY: 4
+      DB_PATH: /data/users.db
+    volumes:
+      - ocr_data:/data
+    networks:
+      - app-network
+    # Not exposed to internet directly — n8n calls it internally as http://ocr-validator:10000
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"        # n8n UI accessible on your server IP:5678
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://<YOUR_SERVER_IP>:5678   # replace with your VPS IP or domain
+      - GENERIC_TIMEZONE=Asia/Kolkata
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - app-network
+    depends_on:
+      - ocr-validator
+
+volumes:
+  ocr_data:
+  n8n_data:
+
+networks:
+  app-network:
+    driver: bridge

@@ -1,5 +1,7 @@
 __pycache__/
+*.pyc
 venv/
-aadhaar.pdf
-marksheet.pdf
-pan.pdf
+.env
+*.pdf
+*.db
+photo_debug.png

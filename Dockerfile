@@ -1,24 +1,28 @@
-# Use a lightweight Python image
 FROM python:3.11-slim
 
-# Install system dependencies for OCR
-RUN apt-get update && apt-get install -y \
+# System deps: OCR + PDF rendering
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-hin \
     poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory inside the container
 WORKDIR /app
-
-# Copy all project files into the container
-COPY . .
-
-# Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Command to run your app
-# CMD ["python", "app.py"]
+COPY . .
+
 EXPOSE 10000
-# CMD ["gunicorn", "-b", "0.0.0.0:10000", "app:app"]
-CMD ["gunicorn", "--timeout", "300", "-b", "0.0.0.0:10000", "app:app"]
+
+# 4 worker processes × 2 threads = handles ~8 concurrent requests comfortably
+# Increase WEB_CONCURRENCY env var to scale up (e.g. 8 for more users)
+CMD ["sh", "-c", "gunicorn \
+    --workers ${WEB_CONCURRENCY:-4} \
+    --threads 2 \
+    --timeout 300 \
+    --bind 0.0.0.0:${PORT:-10000} \
+    --log-level info \
+    app:app"]

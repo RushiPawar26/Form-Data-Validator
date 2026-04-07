@@ -1,236 +1,327 @@
+import os
 import re
+import cv2
+import numpy as np
 from difflib import SequenceMatcher
 from pdf2image import convert_from_path
+from PIL import Image as PILImage
 import pytesseract
 from template_validator import run_template_checks
+
+
+def normalize_doc_type(raw: str) -> str:
+    d = raw.lower().strip()
+    if re.search(r'adh?a+r|aadhar|aadhaar', d):
+        return 'aadhaar card'
+    if 'pan' in d:
+        return 'pan card'
+    if 'marksheet' in d or 'mark sheet' in d or 'result' in d:
+        return 'marksheet'
+    if 'college' in d or 'student id' in d or 'institute' in d:
+        return 'college id'
+    if 'birth' in d:
+        return 'birth certificate'
+    return d
 
 
 def fuzzy_match(a, b, threshold=0.60):
     return SequenceMatcher(None, a, b).ratio() >= threshold
 
-# Optional if Tesseract is not in PATH:
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def ocr_image(pil_img):
+    """Try 4 preprocessing strategies, return the one with most text."""
+    img_np = np.array(pil_img)
+    if len(img_np.shape) == 3:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+    results = []
+
+    # 1. original
+    results.append(pytesseract.image_to_string(pil_img, lang='eng+hin', config='--psm 3'))
+
+    # 2. histogram equalization
+    eq = cv2.equalizeHist(img_np)
+    results.append(pytesseract.image_to_string(PILImage.fromarray(eq), lang='eng+hin', config='--psm 3'))
+
+    # 3. adaptive threshold — best for low-contrast scans
+    thresh = cv2.adaptiveThreshold(img_np, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 31, 10)
+    results.append(pytesseract.image_to_string(PILImage.fromarray(thresh), lang='eng+hin', config='--psm 3'))
+
+    # 4. 2x upscale + adaptive threshold — helps small/dense text
+    up = cv2.resize(img_np, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    thresh2 = cv2.adaptiveThreshold(up, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 31, 10)
+    results.append(pytesseract.image_to_string(PILImage.fromarray(thresh2), lang='eng+hin', config='--psm 3'))
+
+    best = max(results, key=lambda t: len(t.strip()))
+    print(f"� OCR lengths: {[len(r.strip()) for r in results]} → using {len(best.strip())} chars")
+    return best
 
 
-def process_document(pdf_path, form_data):
-    """
-    Validates a single PDF document against its expected form data.
-    """
-    print(f"\n📄 Processing {form_data.get('doc_type')} for {form_data.get('name')}")
+def render_pdf(pdf_path):
+    poppler_path = os.environ.get("POPPLER_PATH") or None
+    for dpi in [300, 200, 150]:
+        try:
+            kwargs = dict(first_page=1, last_page=1, dpi=dpi, grayscale=True)
+            if poppler_path:
+                kwargs["poppler_path"] = poppler_path
+            images = convert_from_path(pdf_path, **kwargs)
+            if images:
+                return images
+        except Exception as e:
+            print(f"DPI {dpi} failed: {e}")
+    return None
 
-    try:
-        images = convert_from_path(
-            pdf_path,
-            first_page=1,
-            last_page=1,
-            dpi=400,
-            grayscale=True,
-            poppler_path=r"C:\Users\TANVI\Downloads\Release-25.12.0-0\poppler-25.12.0\Library\bin"
+
+# ---------------------------------------------------------------------------
+# Confidence scoring — 0 to 100. Pass >= 50, suspicious 50-69, valid >= 70
+# ---------------------------------------------------------------------------
+
+SCORE_WEIGHTS = {
+    'aadhaar card': {
+        'doc_keywords': 20,
+        'name':         35,
+        'dob':          20,
+        'gender':       10,
+        'aadhaar_num':  15,
+    },
+    'pan card': {
+        'doc_keywords': 25,
+        'name':         40,
+        'id_number':    35,
+    },
+    'marksheet': {
+        'doc_keywords': 20,
+        'name':         40,
+        'department':   25,
+        'logo':         15,
+    },
+    'college id': {
+        'doc_keywords': 15,
+        'name':         35,
+        'id_number':    25,
+        'department':   15,
+        'photo':        10,
+    },
+    'birth certificate': {
+        'doc_keywords': 30,
+        'name':         40,
+        'dob':          30,
+    },
+}
+
+DOC_KEYWORDS = {
+    'aadhaar card': [
+        'aadhaar', 'आधार', 'uidai', 'unique identification',
+        'government of india', 'govt of india', 'भारत सरकार',
+        'enrollment', 'vid:', 'dob', 'date of birth'
+    ],
+    'pan card': [
+        'income tax', 'permanent account', 'pan',
+        'भारत सरकार', 'government of india'
+    ],
+    'marksheet': [
+        'university', 'board', 'examination', 'result', 'marks',
+        'grade', 'semester', 'annual', 'certificate', 'seat no',
+        'subject', 'total'
+    ],
+    'college id': [
+        'college', 'university', 'institute', 'student',
+        'id card', 'identity', 'department', 'branch'
+    ],
+    'birth certificate': [
+        'birth certificate', 'date of birth', 'born',
+        'municipal', 'registrar'
+    ],
+}
+
+
+def score_document(full_text, form_data, doc_type, template_results):
+    weights = SCORE_WEIGHTS.get(doc_type, {'doc_keywords': 25, 'name': 50, 'id_number': 25})
+    score = 0
+    breakdown = {}
+    reasons = []
+
+    name       = form_data.get('name', '').lower().strip()
+    id_field   = str(form_data.get('id_number') or form_data.get('roll_number') or
+                     form_data.get('registration_number') or '').lower().replace(' ', '')
+    department = form_data.get('department', '').lower().strip()
+    aadhaar_num = str(form_data.get('aadhaar_number', '')).strip()
+
+    # doc_keywords
+    if 'doc_keywords' in weights:
+        keywords = DOC_KEYWORDS.get(doc_type, [])
+        matched = [k for k in keywords if k in full_text]
+        if matched:
+            score += weights['doc_keywords']
+            breakdown['doc_keywords'] = f"PASS ({', '.join(matched[:3])})"
+        else:
+            reasons.append(f"No {doc_type} keywords found")
+            breakdown['doc_keywords'] = 'FAIL'
+
+    # name
+    if 'name' in weights and name:
+        name_found = name in full_text or any(
+            fuzzy_match(name, full_text[i:i+len(name)])
+            for i in range(len(full_text) - len(name) + 1)
         )
-    except Exception as e:
-        return {
-            'doc_type': form_data.get('doc_type'),
-            'status': f"Error: Could not read PDF file. {e}",
-            'validation_passed': False
-        }
+        if name_found:
+            score += weights['name']
+            breakdown['name'] = 'PASS'
+        else:
+            reasons.append(f"Name '{name}' not found")
+            breakdown['name'] = 'FAIL'
+    elif 'name' in weights:
+        score += weights['name'] // 2
+        breakdown['name'] = 'SKIP'
 
-    full_text = ""
-    for img in images:
-        full_text += pytesseract.image_to_string(img, lang='eng+hin', config='--psm 3')
-
-    full_text = full_text.lower()
-    print(f"🔍 OCR extracted text:\n{full_text[:500]}")  # log first 500 chars
-    name_from_form = form_data.get('name', '').lower()
-
-    # Flexible identifier field names
-    id_field = str(form_data.get('id_number') or form_data.get('roll_number') or form_data.get('registration_number') or '')
-    id_field = id_field.lower().replace(' ', '')
-    expected_doc_type = form_data.get('doc_type', '').lower()
-
-    # --- Document-specific validation rules ---
-    doc_rules = {
-        'aadhaar card': ['aadhaar', 'आधार', 'भारत सरकार', 'goverment of india'],
-        'adhaar card': ['aadhaar', 'आधार', 'uidai', 'unique identification', 'enrollment no', 'vid:'],
-        'pan card': ['income tax department', 'permanent account number', 'pan'],
-        'marksheet': ['marksheet', 'grade', 'university', 'board'],
-        'birth certificate': ['birth certificate', 'date of birth', 'dob'],
-        'college id': ['college','id','university','student']
-    }
-
-    # --- Aadhaar structural validation ---
-    aadhaar_types = ('aadhaar card', 'adhaar card')
-    if expected_doc_type in aadhaar_types:
-        missing = []
-        if 'government of india' not in full_text and 'भारत सरकार' not in full_text:
-            missing.append('Government of India header')
-        if not any(k in full_text for k in ['female', 'male', 'महिला', 'पुरुष']):
-            missing.append('gender field')
-        # check DOB in any format: yyyy-mm-dd, dd-mm-yyyy, dd/mm/yyyy
-        import re as _re
+    # dob
+    if 'dob' in weights:
         dob_found = (
-            any(k in full_text for k in ['dob', 'date of birth', 'जन्म']) or
-            bool(_re.search(r'\d{4}-\d{2}-\d{2}', full_text)) or
-            bool(_re.search(r'\d{2}-\d{2}-\d{4}', full_text)) or
-            bool(_re.search(r'\d{2}/\d{2}/\d{4}', full_text))
+            any(k in full_text for k in ['dob', 'date of birth', 'जन्म', 'year of birth', 'yob']) or
+            bool(re.search(r'\d{2}[\/\-]\d{2}[\/\-]\d{4}', full_text)) or
+            bool(re.search(r'\d{4}[\/\-]\d{2}[\/\-]\d{2}', full_text))
         )
-        if not dob_found:
-            missing.append('date of birth field')
-        if 'xxxx' not in full_text and 'aadhaar' not in full_text:
-            missing.append('Aadhaar number')
-        if missing:
-            return {'doc_type': expected_doc_type,
-                    'status': f"Invalid Aadhaar: missing {', '.join(missing)}.",
-                    'validation_passed': False}
+        if dob_found:
+            score += weights['dob']
+            breakdown['dob'] = 'PASS'
+        else:
+            reasons.append('Date of birth not found')
+            breakdown['dob'] = 'FAIL'
 
-    # Check document keyword (non-Aadhaar)
-    keywords = doc_rules.get(expected_doc_type, [])
-    if expected_doc_type not in aadhaar_types:
-        if not any(k in full_text for k in keywords):
-            return {'doc_type': expected_doc_type,
-                    'status': f"Mismatch: '{expected_doc_type}' keywords not found.",
-                    'validation_passed': False}
+    # gender (minor — doesn't add to reasons)
+    if 'gender' in weights:
+        if any(k in full_text for k in ['female', 'male', 'महिला', 'पुरुष']):
+            score += weights['gender']
+            breakdown['gender'] = 'PASS'
+        else:
+            breakdown['gender'] = 'FAIL (minor)'
 
-    # Check name using fuzzy match to handle OCR misreads
-    if name_from_form:
-        name_found = name_from_form in full_text or any(
-            fuzzy_match(name_from_form, full_text[i:i+len(name_from_form)])
-            for i in range(len(full_text) - len(name_from_form) + 1)
-        )
-        if not name_found:
-            return {'doc_type': expected_doc_type,
-                    'status': f"Mismatch: Name '{name_from_form}' not found.",
-                    'validation_passed': False}
-
-    # Check ID number or Roll number (skip for marksheet)
-    if expected_doc_type != 'marksheet':
-        if id_field:
-            clean_text = full_text.replace(' ', '')
-            if expected_doc_type in ('aadhaar card', 'adhaar card'):
-                # use aadhaar_number field, skip if not provided
-                aadhaar_num = str(form_data.get('aadhaar_number', '')).strip()
-                if not aadhaar_num:
-                    id_found = True  # skip check if no aadhaar number provided
-                else:
-                    id_last4 = aadhaar_num[-4:]
-                    id_found = id_last4 in clean_text
+    # aadhaar last 4
+    if 'aadhaar_num' in weights:
+        if aadhaar_num:
+            last4 = aadhaar_num[-4:]
+            if last4 in full_text.replace(' ', ''):
+                score += weights['aadhaar_num']
+                breakdown['aadhaar_num'] = f'PASS (last4={last4})'
             else:
-                # fuzzy match for college ID since OCR misreads digits
-                id_found = id_field in clean_text or any(
-                    fuzzy_match(id_field, clean_text[i:i+len(id_field)], threshold=0.80)
-                    for i in range(max(len(clean_text) - len(id_field) + 1, 1))
-                )
-            if not id_found:
-                return {'doc_type': expected_doc_type,
-                        'status': f"Mismatch: ID '{id_field}' not found.",
-                        'validation_passed': False}
+                reasons.append(f"Aadhaar last 4 '{last4}' not found")
+                breakdown['aadhaar_num'] = 'FAIL'
+        else:
+            score += weights['aadhaar_num'] // 2
+            breakdown['aadhaar_num'] = 'SKIP'
 
-    # Check department (college ID and marksheet)
-    if expected_doc_type in ('college id', 'marksheet'):
-        department = form_data.get('department', '').lower().strip()
+    # id_number
+    if 'id_number' in weights:
+        if id_field:
+            clean = full_text.replace(' ', '')
+            id_found = id_field in clean or any(
+                fuzzy_match(id_field, clean[i:i+len(id_field)], threshold=0.80)
+                for i in range(max(len(clean) - len(id_field) + 1, 1))
+            )
+            if id_found:
+                score += weights['id_number']
+                breakdown['id_number'] = 'PASS'
+            else:
+                reasons.append(f"ID '{id_field}' not found")
+                breakdown['id_number'] = 'FAIL'
+        else:
+            score += weights['id_number'] // 2
+            breakdown['id_number'] = 'SKIP'
+
+    # department
+    if 'department' in weights:
         if department:
-            # for marksheet, also check first word only (e.g. "computer" from "computer engineering")
-            dept_first_word = department.split()[0] if department else ''
+            dept_first = department.split()[0]
             dept_found = (
                 department in full_text or
-                dept_first_word in full_text or
+                dept_first in full_text or
                 any(fuzzy_match(department, full_text[i:i+len(department)])
                     for i in range(len(full_text) - len(department) + 1))
             )
-            if not dept_found:
-                return {'doc_type': expected_doc_type,
-                        'status': f"Mismatch: Department '{department}' not found.",
-                        'validation_passed': False}
+            if dept_found:
+                score += weights['department']
+                breakdown['department'] = 'PASS'
+            else:
+                reasons.append(f"Department '{department}' not found")
+                breakdown['department'] = 'FAIL'
+        else:
+            score += weights['department'] // 2
+            breakdown['department'] = 'SKIP'
 
-    # --- OCR checks passed — now run template-based checks ---
-    template_results = run_template_checks(images[0], expected_doc_type)
+    # logo
+    if 'logo' in weights:
+        lm = template_results.get('logo_matched')
+        if lm is True:
+            score += weights['logo']
+            breakdown['logo'] = 'PASS'
+        elif lm is False:
+            breakdown['logo'] = 'FAIL (minor)'
+        else:
+            score += weights['logo'] // 2
+            breakdown['logo'] = 'SKIP'
 
-    alignment_status = template_results.get('alignment_status')
-    logo_matched = template_results.get('logo_matched')
-    photo_present = template_results.get('photo_present')
+    # photo
+    if 'photo' in weights:
+        pp = template_results.get('photo_present')
+        if pp is True:
+            score += weights['photo']
+            breakdown['photo'] = 'PASS'
+        elif pp is False:
+            breakdown['photo'] = 'FAIL (minor)'
+        else:
+            score += weights['photo'] // 2
+            breakdown['photo'] = 'SKIP'
 
-    # Strict: fail if alignment too low for college ID only
-    if expected_doc_type == 'college id' and alignment_status == 'suspicious':
+    return min(score, 100), breakdown, reasons
+
+
+def process_document(pdf_path, form_data):
+    raw_doc_type = form_data.get('doc_type', '')
+    doc_type = normalize_doc_type(raw_doc_type)
+    print(f"\n📄 '{raw_doc_type}' → '{doc_type}' for {form_data.get('name')}")
+
+    images = render_pdf(pdf_path)
+    if not images:
+        return {'doc_type': doc_type, 'status': 'Error: Could not render PDF.', 'validation_passed': False}
+
+    full_text = ocr_image(images[0]).lower()
+    print(f"🔍 OCR ({len(full_text)} chars): {full_text[:300]}")
+
+    template_results = run_template_checks(images[0], doc_type)
+    score, breakdown, reasons = score_document(full_text, form_data, doc_type, template_results)
+
+    print(f"📊 Score: {score}/100 | {breakdown}")
+
+    if score >= 50:
+        suspicious = score < 70
         return {
-            'doc_type': expected_doc_type,
-            'status': 'Invalid: Document layout does not match expected template.',
-            'validation_passed': False,
-            **template_results
+            'doc_type': doc_type,
+            'validation_passed': True,
+            'confidence_score': score,
+            'status': f"Valid ({score}/100)" + (" — low confidence, review recommended" if suspicious else ""),
+            'suspicious': suspicious,
+            'breakdown': breakdown,
+            **template_results,
         }
-
-    # Strict: fail if logo explicitly didn't match (skip for marksheet)
-    if expected_doc_type != 'marksheet' and logo_matched is False:
+    else:
         return {
-            'doc_type': expected_doc_type,
-            'status': 'Invalid: Logo not matched.',
+            'doc_type': doc_type,
             'validation_passed': False,
-            **template_results
+            'confidence_score': score,
+            'status': (f"Invalid ({score}/100): " + '; '.join(reasons)) if reasons else f"Invalid ({score}/100)",
+            'breakdown': breakdown,
+            **template_results,
         }
-
-    # Strict: fail if photo not found (skip for marksheet)
-    if expected_doc_type != 'marksheet' and photo_present is False:
-        return {
-            'doc_type': expected_doc_type,
-            'status': 'Invalid: Photo not detected in expected region.',
-            'validation_passed': False,
-            **template_results
-        }
-
-    # Suspicious if alignment is low but don't fail
-    suspicious = alignment_status == 'suspicious'
-
-    return {
-        'doc_type': expected_doc_type,
-        'status': f"Valid: {expected_doc_type} matches the form data." + (" (Suspicious layout)" if suspicious else ""),
-        'validation_passed': True,
-        'suspicious': suspicious,
-        **template_results
-    }
 
 
 def validate_multiple_documents(form_data):
-    """
-    Takes multiple document entries and validates each.
-    """
     results = []
-    documents = form_data.get("documents", [])
-
-    for doc in documents:
+    for doc in form_data.get("documents", []):
         pdf_path = doc.get("pdf_path")
         if not pdf_path:
-            results.append({'doc_type': doc.get("doc_type"), 'status': "No file path provided.", 'validation_passed': False})
+            results.append({'doc_type': doc.get("doc_type"), 'status': "No file path.", 'validation_passed': False})
             continue
-        result = process_document(pdf_path, doc)
-        results.append(result)
-
+        results.append(process_document(pdf_path, doc))
     return results
-
-
-# --- Example usage ---
-if __name__ == '__main__':
-    form_data = {
-        "documents": [
-            {
-                "doc_type": "Aadhaar Card",
-                "pdf_path": "aadhaar.pdf",
-                "name": "Anushree Kamath",
-                "id_number": "973590859427"
-            },
-            {
-                "doc_type": "PAN Card",
-                "pdf_path": "pan.pdf",
-                "name": "Anushree Kamath",
-                "id_number": "MVKPK5101M"
-            },
-            {
-                "doc_type": "Marksheet",
-                "pdf_path": "marksheet.pdf",
-                "name": "Anushree Kamath",
-                "roll_number": "15160071"
-            }
-        ]
-    }
-
-    all_results = validate_multiple_documents(form_data)
-    print("\n--- Final Validation Report ---")
-    for r in all_results:
-        print(f"{r['doc_type']}: {r['status']}")
